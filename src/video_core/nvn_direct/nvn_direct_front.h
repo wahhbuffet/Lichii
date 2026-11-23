@@ -48,6 +48,8 @@ void nvn_direct_alias_release(void* range);
 void* nvn_direct_writable(uint64_t host);
 /// Writable backing for one guest arena page, or NULL for an unmapped or non-guest address.
 void* nvn_direct_guest_backing(uint64_t host);
+void* nvn_direct_writable_run(const void* host, size_t n);   // the backing memory of [host, host+n) when consecutive there, else NULL (nvn_dispatch.c)
+int nvn_direct_guarded(void (*fn)(void*), void* arg, uintptr_t* at, int* wr, unsigned* state, unsigned* prot);   // fn(arg); 0: an access violation inside it, caught (Windows; nvn_dispatch.c)
 /// Where the replay reads guest memory at host (an arena pointer): its backing memory, which a
 /// guest unmap never takes away, NULL when the guest has not mapped the page (the arena's page is
 /// then inaccessible). In a virtual pool's range: unchanged, NULL where nothing is mapped.
