@@ -85,6 +85,7 @@
 #include "core/hle/service/nx2_stub_interface.h"
 #include "core/hle/service/nx2_fence_action.h"
 #include "core/hle/service/nx2_frame_interval.h"
+#include "core/hle/service/nx2_hdr_notifications.h"
 #include "core/hle/service/nx2_image_layout.h"
 #include "core/hle/service/nx2_movie_clock.h"
 #include "core/hle/service/nx2_native_image_lookup.h"
@@ -2887,8 +2888,7 @@ private:
                output.reference_white;
     }
 
-    // What the game is told; m_logged_hdr_output keeps the last answer.
-    Common::HdrOutput HostHdrOutput() {
+    Common::HdrOutput QueryHostHdrOutput() {
         std::optional<Common::DisplayHdrInfo> display;
         const auto output = ResolveHostHdrOutput(display);
         const u64 logged = HdrOutputKey(output);
@@ -2929,15 +2929,19 @@ private:
             return;
         }
         m_hdr_generation = generation;
+        if ((m_hdr_status_slots | m_hdr_paper_white_slots) == 0) {
+            return;
+        }
         std::optional<Common::DisplayHdrInfo> display;
-        if (m_hdr_change_slots == 0 || m_logged_hdr_output == ~u64{} ||
-            HdrOutputKey(ResolveHostHdrOutput(display)) == m_logged_hdr_output) {
+        const u32 slots = m_hdr_notifications.ChangedSlots(
+            ResolveHostHdrOutput(display), m_hdr_status_slots, m_hdr_paper_white_slots);
+        if (slots == 0) {
             return;
         }
         LOG_INFO(Service, "nx2:vi2 display HDR state changed, signalling the game");
         for (u32 index = 0; index < m_native_events.size(); ++index) {
             Kernel::KEvent* const event = m_native_events[index];
-            if ((m_hdr_change_slots >> index) & 1 && event && event->Open(system.Kernel())) {
+            if ((slots >> index) & 1 && event && event->Open(system.Kernel())) {
                 events.push_back(event);
             }
         }
@@ -2945,15 +2949,22 @@ private:
 
     // nn::vi2::QueryDisplayHdrPaperWhite(display name): u16 reference white in nits.
     void QueryDisplayHdrPaperWhite(HLERequestContext& ctx) {
-        TipcReplyWords(ctx, {HostHdrOutput().reference_white});
+        const auto output = QueryHostHdrOutput();
+        std::scoped_lock lk{m_hdr_mutex};
+        TipcReplyWords(ctx, {m_hdr_notifications.RecordPaperWhite(output)});
     }
 
     // Wire reply: u64 output format (1 = SDR, 2 = HDR), u16 peak luminance in nits.
     // MKW's SDK converts these to public formats 0/1 before DefaultDisplay tests for HDR.
     void QueryDisplayHdrStatus(HLERequestContext& ctx) {
-        const auto output = HostHdrOutput();
-        g_nx2_told_hdr = output.enabled;
-        TipcReplyWords(ctx, {output.enabled ? 2U : 1U, 0, output.peak_luminance});
+        const auto status = QueryHostHdrOutput();
+        Nx2HdrNotifications::Status told;
+        {
+            std::scoped_lock lk{m_hdr_mutex};
+            told = m_hdr_notifications.RecordStatus(status);
+        }
+        g_nx2_told_hdr = told.enabled;
+        TipcReplyWords(ctx, {told.enabled ? 2U : 1U, 0, told.peak_luminance});
     }
 
     // 212(u64 layer): u64 bits of the layer's buffer slots that are ready. The client polls it once
@@ -3080,7 +3091,8 @@ private:
         if (index < m_native_events.size() && m_native_events[index]) {
             SetVsyncSlot(index, true);
             std::scoped_lock lk{m_hdr_mutex};
-            m_hdr_change_slots &= ~(1U << index);
+            m_hdr_status_slots &= ~(1U << index);
+            m_hdr_paper_white_slots &= ~(1U << index);
         }
         TipcReplyWords(ctx, {});
     }
@@ -3098,11 +3110,9 @@ private:
             SetVsyncSlot(index, false);
             const u32 command = ctx.GetCommand();
             std::scoped_lock lk{m_hdr_mutex};
-            if (command == 265 || command == 267) {
-                m_hdr_change_slots |= 1U << index;
-            } else {
-                m_hdr_change_slots &= ~(1U << index);
-            }
+            const u32 bit = 1U << index;
+            m_hdr_status_slots = (m_hdr_status_slots & ~bit) | (command == 265 ? bit : 0);
+            m_hdr_paper_white_slots = (m_hdr_paper_white_slots & ~bit) | (command == 267 ? bit : 0);
             m_native_events[index]->Signal(system.Kernel());
         }
         TipcReplyWords(ctx, {});
@@ -3115,7 +3125,8 @@ private:
         if (index < m_native_events.size() && m_native_events[index]) {
             SetVsyncSlot(index, false);
             std::scoped_lock lk{m_hdr_mutex};
-            m_hdr_change_slots &= ~(1U << index);
+            m_hdr_status_slots &= ~(1U << index);
+            m_hdr_paper_white_slots &= ~(1U << index);
         }
         TipcReplyWords(ctx, {});
     }
@@ -3236,12 +3247,14 @@ private:
     u64 m_presents{};
     std::array<std::optional<u64>, 15> m_recorded_ticks{}; ///< 53's recorders, by present word 18
     u64 m_shown_layout{}; // image and crop size last logged
-    // m_logged_hdr_output, m_hdr_generation, m_hdr_change_slots and the m_native_events entries
+    // m_logged_hdr_output, m_hdr_generation, the HDR slots, m_hdr_notifications and the m_native_events entries
     // NotifyHdrChange reads from the game's thread (Nx2NotifyHdrChange).
     std::mutex m_hdr_mutex;
     u64 m_logged_hdr_output{~u64{}}; // HDR status last logged
-    u64 m_hdr_generation{};           // DisplayHdrMonitor generation NotifyHdrChange last saw
-    u32 m_hdr_change_slots{};         // native event slots bound to HDR status / paper white
+    u64 m_hdr_generation{}; // DisplayHdrMonitor generation NotifyHdrChange last saw
+    u32 m_hdr_status_slots{};      // native event slots bound to HDR status
+    u32 m_hdr_paper_white_slots{}; // native event slots bound to HDR paper white
+    Nx2HdrNotifications m_hdr_notifications;
 };
 
 // True the first time a Switch 2 video command is seen, so each one is logged once in full and new
