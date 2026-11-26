@@ -62,6 +62,7 @@ void mtl_set_frame(uint64_t f) {
           vka_enc_stats(pb, sizeof pb, n); if (pb[0]) VLOG("%s", pb);
           vka_floor_stats(pb, sizeof pb); if (pb[0]) VLOG("%s", pb);
           vka_rp_bar_stats(pb, sizeof pb, n); if (pb[0]) VLOG("%s", pb);
+          { void vka_vc_stats(char *b, size_t n, double frames); char vb[1200]; vka_vc_stats(vb, sizeof vb, n); if (vb[0]) VLOG("%s", vb); }
           { void vka_drv_memo_stats(char *b, size_t n); vka_drv_memo_stats(pb, sizeof pb); if (pb[0]) VLOG("%s", pb); } }
         f0 = f; d0 = g_stat_draws; rp0 = vka_n_rp; b0 = vka_n_bar; ub0 = g_n_ub; s0 = g_n_sub; r0 = g_rec_ns; o0 = g_stat_ops; pc0 = g_n_pclear; ch0 = g_n_chunks;
     }
@@ -420,6 +421,7 @@ static inline void chunk_check(void) {
     if (cp > 0 && in >= (uint64_t)cp && vka_rp_open_for(&S.rt, S.has_rt)) { vka_rp_end(); chunk(); }
 }
 static uint64_t g_cur_fence;   // the fence of the submission being replayed, reserved before it (vka_worker.c); 0 = reserved at its commit
+uint64_t vka_rp_fence(void) { return g_cur_fence ? g_cur_fence : vka_fence_last() + 1; }   // Lichii: the fence this submission commits with (vka_draw.c vc_bind: a copy's last reader)
 uint64_t vka_rp_sub_commit(uint64_t reserved) {
     uint64_t fence = reserved ? reserved : vka_fence_next(); g_cur_fence = 0;
     if (g_qn >= 0) g_qt[g_qn].last = fence;   // (queue_move)
