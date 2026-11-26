@@ -18,6 +18,9 @@ on:
   push:
     branches:
       - nx2-experimental
+      # wahhbuffet fork: the direct NVN branch builds every platform, but only for a push whose
+      # newest commit message has [build] in it, and never publishes a release.
+      - nvn-direct-rebase
     # A binary only changes when build inputs change; docs-only pushes skip the build.
     paths:
       - "src/**"
@@ -60,7 +63,7 @@ jobs:
       contents: write
       actions: read
     outputs:
-      build: ${{ steps.nightly.outputs.build || 'true' }}
+      build: ${{ steps.nightly.outputs.build || steps.nvn-direct.outputs.build || 'true' }}
     steps:
       - name: Skip a nightly run for a commit nx2 already built
         id: nightly
@@ -72,6 +75,14 @@ jobs:
             --json headSha --jq '.[0].headSha // ""')
           echo "build=$([ "$built" = "$GITHUB_SHA" ] && echo false || echo true)" >> "$GITHUB_OUTPUT"
 
+      - name: Build a direct NVN push only when its message asks for it ([build])
+        id: nvn-direct
+        if: github.event_name == 'push' && github.ref == 'refs/heads/nvn-direct-rebase'
+        env:
+          MESSAGE: ${{ github.event.head_commit.message }}
+        run: |
+          case "$MESSAGE" in *"[build]"*) echo "build=true" ;; *) echo "build=false" ;; esac >> "$GITHUB_OUTPUT"
+
       - name: Refuse to publish an Aftermath build
         if: inputs.nsight_aftermath && inputs.publish_release
         run: |
@@ -79,7 +90,7 @@ jobs:
           exit 1
 
       - name: Prepare release tag
-        if: github.event_name == 'push' || inputs.publish_release
+        if: (github.event_name == 'push' && github.ref == 'refs/heads/nx2-experimental') || inputs.publish_release
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
@@ -790,7 +801,7 @@ jobs:
   release:
     name: Publish release
     needs: build
-    if: github.event_name == 'push' || inputs.publish_release
+    if: (github.event_name == 'push' && github.ref == 'refs/heads/nx2-experimental') || inputs.publish_release
     runs-on: ubuntu-24.04
     permissions:
       contents: write
