@@ -883,6 +883,34 @@ static VkBufferView tbuf_view(const vka_shader *sh, const vka_res *r) {
 typedef struct { VkWriteDescriptorSet w[512]; VkDescriptorBufferInfo bi[512]; VkDescriptorImageInfo ii[512]; VkBufferView bv[512]; uint32_t n; } writes_t;
 static writes_t g_w;
 static vka_res g_res[512];   // the NaN scan's own walk (DM_VK_NANSCAN_FS)
+// Lichii diagnostics (DM_VK_NANSCAN_FS, the first 2 probed draws): the pixel shader's binding records and what the walk (g_res, n entries) made of each; a texture handle
+// read from a uniform buffer (TEX_UBO) is read again once the submission is done: a handle written after the record time (an inline update, a GPU write) reads differently then
+static struct { uint64_t addr; uint32_t was; int binding; } g_hchk[64]; static int g_nhchk;
+static void hchk_done(void *arg) {
+    (void)arg;
+    for (int i = 0; i < g_nhchk; i++) { uint32_t now = 0; int ok = cpu_read(g_hchk[i].addr, &now, 4);
+        VLOG("NaN scan: binding %d: texture handle at %#llx read %#x at record time, %#x%s after the submission", g_hchk[i].binding, (unsigned long long)g_hchk[i].addr, g_hchk[i].was, now, ok ? "" : " (unreadable)"); }
+    g_nhchk = 0;
+}
+static void nan_fs_bindings(const vka_dstate *d, const vka_shader *fs, int n) {
+    static int probes; if (probes >= 2) return; probes++;
+    VLOG("NaN scan: fragment %016llx: %u binding records, walk gave %d entries, tex base %d samp base %d", (unsigned long long)fs->key, fs->e->bind_count, n, d->b.tex_base, d->b.samp_base);
+    for (unsigned i = 0; i < fs->e->bind_count; i++) {
+        const dmsh_vk_bind *b = &fs->b[i]; char r[160] = "";
+        for (int k = 0; k < n; k++) if (g_res[k].binding == b->binding && g_res[k].elem == 0) {
+            snprintf(r, sizeof r, "what %u tid %d sid %d addr %#llx size %llu", g_res[k].what, g_res[k].tid, g_res[k].sid, (unsigned long long)g_res[k].addr, (unsigned long long)g_res[k].size);
+            if (g_res[k].what == VKA_R_TEX && g_res[k].tid) { char t[200]; vka_tex_id_desc(g_res[k].tid, t, sizeof t); size_t o = strlen(r); snprintf(r + o, sizeof r - o, " (%.100s)", t); }
+            break; }
+        uint64_t ua = 0; uint32_t word = 0;
+        if (b->kind == DMSH_VK_KIND_TEX_UBO && b->reg >= 0 && b->reg < 16 && d->b.ubo[1][b->reg].addr) {
+            ua = d->b.ubo[1][b->reg].addr + b->off; cpu_read(ua, &word, 4);
+            if (g_nhchk < 64) g_hchk[g_nhchk++] = (typeof(g_hchk[0])){ua, word, b->binding};
+        }
+        VLOG("NaN scan:   binding %u kind %u set %u desc %u count %u reg %d off %u dim %u skind %u sreg %d soff %u flags %#x%s%s ubo word %#llx = %#x -> %s", b->binding, b->kind, b->set, b->desc,
+             b->count, b->reg, b->off, b->dim, b->skind, b->sreg, b->soff, b->flags, b->set == DMSH_VK_SET_POOL ? " (pool set)" : "", "", (unsigned long long)ua, word, r[0] ? r : "nothing (null)");
+    }
+    if (g_nhchk) vka_after(vka_fence_last() + 1, hchk_done, NULL);
+}
 // One stage's results as descriptor writes. 0 = the draw cannot run (logged)
 static int stage_writes(const vka_dstate *d, int st, const vka_shader *sh, const vka_res *r, int n, int pool, c0_at *c0) {
     for (int i = 0; i < n; i++) {
@@ -1245,7 +1273,7 @@ static void vin_bind(const vka_dstate *d) {
     for (uint32_t st = 0; st < 16; st++) if (VI.used >> st & 1) {   // each stream at its address, as far as it is bound and placed
         VkBuffer b = g_zero.buf; VkDeviceSize o = g_zero.off, sz = 65536;
         uint64_t addr = d->vbuf[st].address, size = d->vbuf[st].size;
-        if (addr) { VkBuffer cb; VkDeviceSize co; uint64_t run = vka_addr_run(addr, size ? size : 1ull << 30, &cb, &co);
+        if (addr && !VKA_ENV("DM_VK_XP_VB_ZERO", 0)) { VkBuffer cb; VkDeviceSize co; uint64_t run = vka_addr_run(addr, size ? size : 1ull << 30, &cb, &co);
                     if (run) { b = cb; o = co; sz = run; } else VRED_ONCE("vertex stream at %#llx is not in placed guest RAM: it reads zeros", (unsigned long long)addr); }
         vb_set(st, b, o, sz, &n0, &nn, rb, ro, rs);
     }
@@ -1398,6 +1426,7 @@ void vka_draw(vka_dstate *d, const p_set_rt *rt, int has_rt, const p_scissor *sc
     if (R.on && R.bar_pending && bar_hazard(sh, d)) { g_bar_late++; vka_rp_end(); }   // the game barrier taken inside the pass is needed here: the pass ends (its full barrier) first
     if (vka_nan_on() >= 2 && sh[1] && !d->rast_discard && vka_nan_probe(sh[1]->key)) {   // DM_VK_NANSCAN_FS: this draw's sampled textures, scanned before it
         char why[8]; int n = vka_walk(&d->b, 1, sh[1]->e, sh[1]->b, sh[1]->lib->h->ssbo_align, 0, rd_cb, NULL, g_res, 512, NULL, why, sizeof why), m = 0;
+        nan_fs_bindings(d, sh[1], n);
         static vka_img *ims[64]; static int bs[64], ts[64];
         for (int i = 0; i < n && m < 64; i++) if (g_res[i].what == VKA_R_TEX && g_res[i].tid) { ims[m] = vka_tex_id_img(g_res[i].tid, g_cb); bs[m] = g_res[i].binding; ts[m++] = g_res[i].tid;
             static _Atomic int nd; if (atomic_fetch_add(&nd, 1) < 32) { char why[320]; vka_tex_id_desc(g_res[i].tid, why, sizeof why); vka_img *im = ims[m - 1];
@@ -1516,6 +1545,7 @@ void vka_draw(vka_dstate *d, const p_set_rt *rt, int has_rt, const p_scissor *sc
         if (x1 <= x0 || y1 <= y0) return;   // an empty scissor: nothing drawn
         scr = (VkRect2D){{(int32_t)x0, (int32_t)y0}, {(uint32_t)(x1 - x0), (uint32_t)(y1 - y0)}};
     }
+    // (DM_VK_XP_VB_ZERO=1, vin_bind: experiment (wrong picture), every vertex stream reads the zeros buffer in device memory, to split vertex fetch from guest RAM off the rest)
     { int xs = VKA_ENV("DM_VK_XP_SCISSOR", 0);   // experiment (wrong picture): every draw's scissor cut to xs x xs pixels, to split a pass's GPU time into per-pixel and per-draw work
       if (xs > 0) { if (scr.extent.width > (uint32_t)xs) scr.extent.width = (uint32_t)xs; if (scr.extent.height > (uint32_t)xs) scr.extent.height = (uint32_t)xs; } }
     DY_SET(sc, scr, vk.vkCmdSetScissor(g_cb, 0, 1, &scr));
@@ -1628,6 +1658,10 @@ void vka_draw(vka_dstate *d, const p_set_rt *rt, int has_rt, const p_scissor *sc
         else vk.vkCmdDrawIndexed(g_cb, (uint32_t)di->count, inst, 0, di->base_vertex, binst);
     }
     g_draws++;
+    if (vka_gp_active) { char b[96]; const int32_t cnt = dw ? dw->count : di->count;   // DM_VK_GPUPROF_DRAWS
+        snprintf(b, sizeof b, "%s %d x%u vp %.0fx%.0f sc %ux%u pass %ux%u", mesh ? "mesh" : ind ? "indirect" : di ? "indexed" : "arrays", cnt, inst, d->vp[0][2], d->vp[0][3],
+                 scr.extent.width, scr.extent.height, R.area.extent.width, R.area.extent.height);
+        vka_gp_draw(g_cb, sh[0] ? sh[0]->key : sh[7] ? sh[7]->key : 0, sh[1] ? sh[1]->key : 0, b); }
     PT(8);
     if (vka_nan_on() >= 2 && vka_nan_split(R.cim, R.nci)) vka_rp_end();   // DM_VK_NANSCAN=2: a scan inside the game's pass
 }
